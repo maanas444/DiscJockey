@@ -792,7 +792,7 @@ class Player(QWidget):
         super().__init__()
         self.setWindowTitle("DiscJockey")
         self.resize(self.NORMAL_SIZE)
-        self.normal_size = QSize(self.NORMAL_SIZE)
+        self.setWindowState(Qt.WindowState.WindowMaximized)  # open maximised by default
         self.settings = QSettings("DiscJockey", "DiscJockey")
         self.vlc = vlc.Instance("--no-video", "--quiet") if vlc else None
         self.mp = self.vlc.media_player_new() if self.vlc else None
@@ -1073,7 +1073,6 @@ class Player(QWidget):
         self.update()
 
     def set_ambient(self, on):
-        was = self.ambient
         self.ambient = on
         self.b_ambient.setChecked(on)
         for w in (self.top_bar, self.speed_bar, self.list):
@@ -1085,18 +1084,15 @@ class Player(QWidget):
         else:
             self.stage.setFixedHeight(self.STAGE_H)
             self.root.setStretchFactor(self.stage, 0)
-        if not self.isFullScreen():
-            if on and not was:
-                self.normal_size = self.size()
-                self.resize(self.AMBIENT_SIZE)
-            elif was and not on:
-                self.resize(self.normal_size)
+        # Maximise when entering ambient. Leaving ambient keeps the current size.
+        if on and not self.isFullScreen():
+            self.setWindowState(Qt.WindowState.WindowMaximized)
         self.settings.setValue("ambient", on)
         self.update()
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
-            self.showNormal()
+            self.setWindowState(Qt.WindowState.WindowMaximized)   # back to maximised, not 430×860
         else:
             if not self.ambient:
                 self.set_ambient(True)
@@ -1104,7 +1100,7 @@ class Player(QWidget):
 
     def on_escape(self):
         if self.isFullScreen():
-            self.showNormal()
+            self.setWindowState(Qt.WindowState.WindowMaximized)
         elif self.ambient:
             self.set_ambient(False)
 
