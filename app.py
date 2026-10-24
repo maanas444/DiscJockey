@@ -17,7 +17,7 @@ import time
 import urllib.request
 from ctypes import wintypes
 
-from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QFont, QImage, QKeySequence,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
                            QRadialGradient, QShortcut)
@@ -228,6 +228,89 @@ def fmt_time(ms):
     return f"{s // 60}:{s % 60:02d}"
 
 
+class Palette:
+    """Colours for the whole window, derived from the cover."""
+
+    def __init__(self, bg_top, bg_bottom, accent, glow):
+        self.bg_top = QColor(bg_top)
+        self.bg_bottom = QColor(bg_bottom)
+        self.accent = QColor(accent)
+        self.glow = QColor(glow)
+
+
+DEFAULT_PALETTE = Palette("#3d3070", "#0e0b1f", "#b9a6ff", "#8f7bff")
+
+
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def palette_from_image(img):
+    """
+    Pick a background gradient from the cover's dominant colour and an accent from its
+    most vivid colour. Dark / colourless covers get a dark neutral gradient with a bright
+    accent (or near-white if the cover has no colour at all), so controls always pop.
+    """
+    n = 48
+    small = img.scaled(n, n, Qt.AspectRatioMode.IgnoreAspectRatio,
+                       Qt.TransformationMode.SmoothTransformation
+                       ).convertToFormat(QImage.Format.Format_RGB32)
+    bins = 12
+    area = [0.0] * bins       # saturation * value, summed: how much "colour" each hue has
+    count = [0] * bins
+    vivid = [0] * bins        # pixels that are both saturated and bright
+    hue_sum = [0.0] * bins
+    sat_sum = [0.0] * bins
+    lum = 0.0
+    for y in range(n):
+        for x in range(n):
+            c = small.pixelColor(x, y)
+            lum += 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
+            h, s, v = c.hueF(), c.saturationF(), c.valueF()
+            if h < 0 or s < 0.18 or v < 0.15:
+                continue                       # ignore greys, near-blacks
+            b = min(bins - 1, int(h * bins))
+            area[b] += s * v
+            count[b] += 1
+            hue_sum[b] += h
+            sat_sum[b] += s
+            if s > 0.35 and v > 0.4:
+                vivid[b] += 1
+    lum /= n * n
+    colourful = sum(area) / (n * n)
+
+    dom = max(range(bins), key=lambda b: area[b])
+    have_dom = colourful >= 0.05 and count[dom] > 0
+    vb = max(range(bins), key=lambda b: vivid[b])
+    have_vivid = vivid[vb] >= 8 and count[vb] > 0
+
+    def mean(b):
+        return hue_sum[b] / count[b], sat_sum[b] / count[b]
+
+    if have_dom:
+        hd, sd = mean(dom)
+        s_bg = _clamp(sd, 0.35, 0.85)
+        bg_top = QColor.fromHsvF(hd, s_bg, 0.52 if lum > 0.3 else 0.42)
+        bg_bottom = QColor.fromHsvF(hd, min(0.9, s_bg), 0.12)
+    else:
+        hd = mean(vb)[0] if have_vivid else 0.62
+        bg_top = QColor.fromHsvF(hd, 0.16, 0.26)
+        bg_bottom = QColor.fromHsvF(hd, 0.22, 0.08)
+
+    if have_vivid:
+        ha, sa = mean(vb)
+        accent = QColor.fromHsvF(ha, _clamp(sa, 0.45, 0.85), 1.0)
+    elif have_dom:
+        ha = hd
+        accent = QColor.fromHsvF(hd, _clamp(sd, 0.35, 0.7), 1.0)
+    else:
+        ha = hd
+        accent = QColor.fromHsvF(hd, 0.08, 1.0)    # near-white pops on the dark neutral gradient
+    colourless = not have_dom and not have_vivid
+    glow = QColor.fromHsvF(ha, 0.25 if colourless else 0.8, 0.9 if colourless else 0.95)
+    return Palette(bg_top, bg_bottom, accent, glow)
+
+
 class ArtWidget(QWidget):
     """Flat album art with a soft shadow, scaled to whatever room it gets."""
 
@@ -244,7 +327,7 @@ class ArtWidget(QWidget):
 
     def paintEvent(self, _):
         side = min(self.width(), self.height())
-        inner = int(side * 0.94)
+        inner = int(side * 0.92)
         if inner < 20:
             return
         if self._cache is None or self._cache[0] != inner:
@@ -257,8 +340,8 @@ class ArtWidget(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 14))
         for i in range(8):
-            grow = i * 1.6
-            p.drawRoundedRect(QRectF(x - grow, y - grow + 8, inner + 2 * grow, inner + 2 * grow),
+            grow = i * 1.0
+            p.drawRoundedRect(QRectF(x - grow, y - grow + 5, inner + 2 * grow, inner + 2 * grow),
                               radius + grow, radius + grow)
         p.drawPixmap(int(x), int(y), self._cache[1])
 
@@ -486,24 +569,16 @@ class VinylWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.setPen(Qt.PenStyle.NoPen)
 
-        # coloured glow behind the record
-        c_hi, c_lo = QColor(self.glow), QColor(self.glow)
-        c_hi.setAlpha(85)
-        c_lo.setAlpha(0)
-        glow = QRadialGradient(centre, R * 1.4)
-        glow.setColorAt(0.0, c_hi)
-        glow.setColorAt(0.72, c_hi)
-        glow.setColorAt(1.0, c_lo)
-        p.setBrush(glow)
-        p.drawEllipse(centre, R * 1.4, R * 1.4)
-
-        # drop shadow
-        sh = QRadialGradient(QPointF(cx, cy + R * 0.05), R * 1.1)
-        sh.setColorAt(0.0, QColor(0, 0, 0, 170))
-        sh.setColorAt(0.9, QColor(0, 0, 0, 150))
-        sh.setColorAt(1.0, QColor(0, 0, 0, 0))
+        # soft drop shadow: fades to nothing before it can reach the widget edge
+        # (the coloured glow lives in the window background, so it is never clipped)
+        sr = min(R * 1.08, h - cy - R * 0.03)
+        sh = QRadialGradient(QPointF(cx, cy + R * 0.03), sr)
+        for i in range(21):
+            t = i / 20
+            u = max(0.0, min(1.0, (t - 0.78) / 0.22))
+            sh.setColorAt(t, QColor(0, 0, 0, int(165 * (1 - u * u * (3 - 2 * u)))))
         p.setBrush(sh)
-        p.drawEllipse(QPointF(cx, cy + R * 0.05), R * 1.1, R * 1.1)
+        p.drawEllipse(QPointF(cx, cy + R * 0.03), sr, sr)
 
         # the record itself (cached, just rotated each frame)
         if self._disc is None or self._disc[0] != side:
@@ -581,10 +656,11 @@ class Player(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DiscJockey")
+        self.setWindowTitle("Disc Player")
         self.resize(self.NORMAL_SIZE)
         self.normal_size = QSize(self.NORMAL_SIZE)
-        self.settings = QSettings("DiscJockey", "DiscJockey")
+        self.settings = QSettings("DiscPlayer", "DiscPlayer")
+
         self.vlc = vlc.Instance("--no-video", "--quiet") if vlc else None
         self.mp = self.vlc.media_player_new() if self.vlc else None
 
@@ -600,7 +676,7 @@ class Player(QWidget):
         self.playing = False
         self.seeking = False
         self.started_at = 0.0
-        self.theme = QColor("#3a2c6b")
+        self.colors = DEFAULT_PALETTE
         self.backdrop = None
         self.vinyl_mode = self.settings.value("vinyl", True, type=bool)
         self.ambient = False
@@ -609,7 +685,7 @@ class Player(QWidget):
         self.bridge.meta.connect(self.apply_meta)
 
         self.build_ui()
-        self.apply_theme(self.theme)
+        self.apply_theme(self.colors)
         self.set_vinyl(self.vinyl_mode)
         self.set_ambient(self.settings.value("ambient", False, type=bool))
 
@@ -639,7 +715,7 @@ class Player(QWidget):
 
         # mode row
         modes = QHBoxLayout()
-        brand = QLabel("DISC JOCKEY")
+        brand = QLabel("DISC PLAYER")
         brand.setObjectName("brand")
         f = brand.font()
         f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
@@ -756,11 +832,10 @@ class Player(QWidget):
         b.setFixedSize(size, size)
         return b
 
-    def apply_theme(self, base):
-        self.theme = QColor(base)
-        h = max(base.hue(), 0)
-        accent = QColor.fromHsv(h, 110, 255).name()
-        self.vinyl.set_glow(QColor.fromHsv(h, 200, 255))
+    def apply_theme(self, colors):
+        self.colors = colors
+        accent = colors.accent.name()
+        self.vinyl.set_glow(colors.accent)
         self.setStyleSheet(f"""
         QWidget {{ color: #f2f2f7; font-family: 'Segoe UI'; font-size: 10pt; }}
         QLabel {{ background: transparent; color: #c9c9d6; }}
@@ -791,6 +866,13 @@ class Player(QWidget):
         QListWidget::item {{ padding: 8px 10px; border-radius: 8px; color: #d6d6e2; }}
         QListWidget::item:hover {{ background: rgba(255,255,255,0.08); }}
         QListWidget::item:selected {{ background: rgba(255,255,255,0.16); color: {accent}; }}
+        QComboBox::drop-down {{ border: none; width: 24px; }}
+        QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 0; }}
+        QScrollBar::handle:vertical {{ background: rgba(255,255,255,0.25); border-radius: 4px;
+                                       min-height: 24px; }}
+        QScrollBar::handle:vertical:hover {{ background: rgba(255,255,255,0.4); }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
         """)
         self.update()
 
@@ -798,11 +880,9 @@ class Player(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         r = self.rect()
-        hue = max(self.theme.hue(), 0)
-        sat = min(self.theme.saturation(), 170)
         g = QLinearGradient(0, 0, 0, r.height())
-        g.setColorAt(0, QColor.fromHsv(hue, sat, 70))
-        g.setColorAt(1, QColor.fromHsv(hue, sat, 18))
+        g.setColorAt(0, self.colors.bg_top)
+        g.setColorAt(1, self.colors.bg_bottom)
         p.fillRect(r, g)
         if self.backdrop is not None:
             bp = self.backdrop
@@ -817,12 +897,41 @@ class Player(QWidget):
             veil.setColorAt(1, QColor(0, 0, 0, 150))
             p.fillRect(r, veil)
 
+        # colour glow behind the record / cover. Painted on the window itself (not inside the
+        # record widget) so it fades out smoothly instead of being cut off by a widget edge.
+        cx, cy, R = self.record_geometry()
+        if R > 10:
+            radius = R * 2.3
+            glow = QRadialGradient(QPointF(cx, cy), radius)
+            for i in range(25):
+                t = i / 24
+                c = QColor(self.colors.glow)
+                c.setAlphaF(0.5 * (1 - t ** 1.5) ** 2)
+                glow.setColorAt(t, c)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Screen)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(glow)
+            p.drawEllipse(QPointF(cx, cy), radius, radius)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+    def record_geometry(self):
+        """Centre and radius (in window coordinates) of the record, or of the flat cover."""
+        top_left = self.stage.mapTo(self, QPoint(0, 0))
+        sw, sh = self.stage.width(), self.stage.height()
+        side = min(sw, sh)
+        ox, oy = top_left.x() + (sw - side) / 2, top_left.y() + (sh - side) / 2
+        if self.vinyl_mode:
+            return (ox + side * VinylWidget.CENTER[0], oy + side * VinylWidget.CENTER[1],
+                    side * VinylWidget.RADIUS)
+        return ox + side / 2, oy + side / 2, side * 0.47
+
     # ---- View modes -------------------------------------------------------- #
     def set_vinyl(self, on):
         self.vinyl_mode = on
         self.b_vinyl.setChecked(on)
         self.stack.setCurrentWidget(self.vinyl if on else self.art)
         self.settings.setValue("vinyl", on)
+        self.update()
 
     def set_ambient(self, on):
         was = self.ambient
@@ -904,7 +1013,7 @@ class Player(QWidget):
         self.subtitle.setText(subtitle)
         self.set_cover(default_raw())
         self.set_backdrop(None)
-        self.apply_theme(QColor("#3a2c6b"))
+        self.apply_theme(DEFAULT_PALETTE)
         self.seek.setRange(0, 1)
         self.t_cur.setText("0:00")
         self.t_tot.setText("0:00")
@@ -950,9 +1059,7 @@ class Player(QWidget):
             if not img.isNull():
                 self.set_cover(QPixmap.fromImage(img))
                 self.set_backdrop(img)
-                avg = img.scaled(1, 1, Qt.AspectRatioMode.IgnoreAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation).pixelColor(0, 0)
-                self.apply_theme(avg)
+                self.apply_theme(palette_from_image(img))
         self.refresh_list()
         self.show_current()
 
