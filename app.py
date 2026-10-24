@@ -1,15 +1,16 @@
 """
-Disc Player - an aesthetic audio CD player for Windows.
-
+DiscJockey - an aesthetic audio CD player for Windows.
 Features: drive scanning, album art + track names (MusicBrainz / Cover Art Archive),
 seek slider, previous/next, playback speed, shuffle, repeat (off / all / one),
-a spinning-vinyl mode and an ambient / fullscreen mode with a blurred cover backdrop.
+a spinning-vinyl mode and an ambient / fullscreen mode with a blurred cover backdrop,
+and a system-tray mode that wakes the window when a disc is inserted.
 """
 import base64
 import ctypes
 import hashlib
 import json
 import math
+import os
 import random
 import sys
 import threading
@@ -17,26 +18,32 @@ import time
 import urllib.request
 from ctypes import wintypes
 
-from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QFont, QImage, QKeySequence,
-                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
-                           QRadialGradient, QShortcut)
-from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QListWidget,
-                               QMessageBox, QPushButton, QSizePolicy, QSlider, QStackedLayout,
-                               QStyle, QStyleOptionSlider, QVBoxLayout, QWidget)
-
+if getattr(sys, "frozen", False):  # running as the packaged .exe
+    _vlc_dir = os.path.join(sys._MEIPASS, "vlc")
+    os.environ.setdefault("PYTHON_VLC_LIB_PATH", os.path.join(_vlc_dir, "libvlc.dll"))
+    os.environ.setdefault("VLC_PLUGIN_PATH", os.path.join(_vlc_dir, "plugins"))
 try:
     import vlc
 except Exception:  # pragma: no cover
     vlc = None
 
-USER_AGENT = "DiscPlayer/1.1 (personal hobby project)"
-QWIDGETSIZE_MAX = 16777215
+from PySide6.QtCore import (QAbstractNativeEventFilter, QObject, QPoint, QPointF, QRectF,
+                            QSettings, QSize, Qt, QTimer, Signal)
+from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QFont, QImage, QKeySequence,
+                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+                           QRadialGradient, QShortcut)
+from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QListWidget,
+                               QMenu, QMessageBox, QPushButton, QSizePolicy, QSlider,
+                               QStackedLayout, QStyle, QStyleOptionSlider, QSystemTrayIcon,
+                               QVBoxLayout, QWidget)
 
+USER_AGENT = "DiscJockey/1.2 (personal hobby project)"
+QWIDGETSIZE_MAX = 16777215
 
 # --------------------------------------------------------------------------- #
 # Disc access (Windows): list drives, read the table of contents
 # --------------------------------------------------------------------------- #
+
 def list_cd_drives():
     """Return drive letters (e.g. ['D']) of optical drives."""
     if sys.platform != "win32":
@@ -71,7 +78,6 @@ def read_toc(letter):
                                     ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
     k32.DeviceIoControl.restype = wintypes.BOOL
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
-
     GENERIC_READ, SHARE_RW, OPEN_EXISTING = 0x80000000, 3, 3
     invalid = ctypes.c_void_p(-1).value
     h = k32.CreateFileW(f"\\\\.\\{letter}:", GENERIC_READ, SHARE_RW, None, OPEN_EXISTING, 0, None)
@@ -85,7 +91,6 @@ def read_toc(letter):
             return None
     finally:
         k32.CloseHandle(h)
-
     data = buf.raw
     length = (data[0] << 8) | data[1]
     first, last = data[2], data[3]
@@ -131,8 +136,48 @@ def musicbrainz_disc_id(toc):
 
 
 # --------------------------------------------------------------------------- #
+# Disc arrival detection (Windows): wakes the app when media goes into a drive
+# --------------------------------------------------------------------------- #
+
+WM_DEVICECHANGE = 0x0219
+DBT_DEVICEARRIVAL = 0x8000
+DBT_DEVTYP_VOLUME = 0x00000002
+
+
+class DEV_BROADCAST_VOLUME(ctypes.Structure):
+    _fields_ = [("dbcv_size", wintypes.DWORD),
+                ("dbcv_devicetype", wintypes.DWORD),
+                ("dbcv_reserved", wintypes.DWORD),
+                ("dbcv_unitmask", wintypes.DWORD),
+                ("dbcv_flags", wintypes.WORD)]
+
+
+class DiscArrivalFilter(QAbstractNativeEventFilter):
+    """Calls back with the drive letter when Windows reports media in an optical drive."""
+
+    def __init__(self, on_arrival):
+        super().__init__()
+        self.on_arrival = on_arrival
+
+    def nativeEventFilter(self, event_type, message):
+        if sys.platform == "win32" and bytes(event_type) == b"windows_generic_MSG":
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_DEVICECHANGE and msg.wParam == DBT_DEVICEARRIVAL and msg.lParam:
+                info = DEV_BROADCAST_VOLUME.from_address(msg.lParam)
+                if info.dbcv_devicetype == DBT_DEVTYP_VOLUME:
+                    cd_drives = set(list_cd_drives())
+                    for i in range(26):
+                        letter = chr(ord("A") + i)
+                        if info.dbcv_unitmask & (1 << i) and letter in cd_drives:
+                            # Defer so the event handler returns quickly
+                            QTimer.singleShot(0, lambda l=letter: self.on_arrival(l))
+        return False, 0
+
+
+# --------------------------------------------------------------------------- #
 # Metadata + cover art (MusicBrainz / Cover Art Archive)
 # --------------------------------------------------------------------------- #
+
 def _get(url, timeout=10):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     return urllib.request.urlopen(req, timeout=timeout).read()
@@ -186,6 +231,7 @@ def fetch_metadata(toc, n_tracks):
 # --------------------------------------------------------------------------- #
 # Drawing helpers
 # --------------------------------------------------------------------------- #
+
 def rounded(pixmap, size, radius=None):
     radius = radius if radius is not None else max(14, int(size * 0.075))
     pm = pixmap.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -278,7 +324,6 @@ def palette_from_image(img):
                 vivid[b] += 1
     lum /= n * n
     colourful = sum(area) / (n * n)
-
     dom = max(range(bins), key=lambda b: area[b])
     have_dom = colourful >= 0.05 and count[dom] > 0
     vb = max(range(bins), key=lambda b: vivid[b])
@@ -296,7 +341,6 @@ def palette_from_image(img):
         hd = mean(vb)[0] if have_vivid else 0.62
         bg_top = QColor.fromHsvF(hd, 0.16, 0.26)
         bg_bottom = QColor.fromHsvF(hd, 0.22, 0.08)
-
     if have_vivid:
         ha, sa = mean(vb)
         accent = QColor.fromHsvF(ha, _clamp(sa, 0.45, 0.85), 1.0)
@@ -348,7 +392,6 @@ class ArtWidget(QWidget):
 
 class VinylWidget(QWidget):
     """A turntable: spinning record with the cover as its label, plus a tonearm."""
-
     DEG_PER_SEC = 200.0                      # 33 1/3 rpm
     REST_PHI, PLAY_PHI, DRIFT = 84.0, 102.0, 15.0
     PIVOT = (0.88, 0.14)
@@ -440,7 +483,6 @@ class VinylWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.translate(D / 2, D / 2)
         origin = QPointF(0, 0)
-
         body = QRadialGradient(origin, R)
         body.setColorAt(0.0, QColor(34, 34, 38))
         body.setColorAt(0.6, QColor(15, 15, 17))
@@ -448,7 +490,6 @@ class VinylWidget(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(body)
         p.drawEllipse(origin, R, R)
-
         # grooves
         p.setBrush(Qt.BrushStyle.NoBrush)
         r, i, step = R * 0.40, 0, max(1.8, R * 0.011)
@@ -464,7 +505,6 @@ class VinylWidget(QWidget):
         # rim
         p.setPen(QPen(QColor(255, 255, 255, 45), 1.4))
         p.drawEllipse(origin, R - 0.8, R - 0.8)
-
         # label (cover art)
         lr = R * 0.36
         clip = QPainterPath()
@@ -492,7 +532,6 @@ class VinylWidget(QWidget):
         p.drawEllipse(origin, lr * 0.97, lr * 0.97)
         p.setPen(QPen(QColor(0, 0, 0, 120), 2))
         p.drawEllipse(origin, lr * 1.1, lr * 1.1)
-
         # spindle hole
         hole = R * 0.03
         p.setPen(QPen(QColor(205, 205, 212), 1.5))
@@ -506,7 +545,6 @@ class VinylWidget(QWidget):
         L = side * self.ARM_LEN
         off = 3 + 9 * (1 - down)             # shadow drifts away when the arm lifts
         none = Qt.PenStyle.NoPen
-
         p.save()
         p.translate(px + off, py + off * 1.5)
         p.rotate(self.arm_phi)
@@ -515,7 +553,6 @@ class VinylWidget(QWidget):
         p.setPen(sp)
         p.drawLine(QPointF(-side * 0.07, 0), QPointF(L + side * 0.05, 0))
         p.restore()
-
         p.save()
         p.translate(px, py)
         p.rotate(self.arm_phi)
@@ -543,7 +580,6 @@ class VinylWidget(QWidget):
         p.setBrush(self.glow)
         p.drawRect(QRectF(side * 0.035, -side * 0.0045, side * 0.022, side * 0.009))
         p.restore()
-
         base = QRadialGradient(QPointF(px - side * 0.012, py - side * 0.012), side * 0.065)
         base.setColorAt(0, QColor(232, 232, 240))
         base.setColorAt(1, QColor(88, 88, 98))
@@ -563,12 +599,10 @@ class VinylWidget(QWidget):
         cx, cy = ox + side * self.CENTER[0], oy + side * self.CENTER[1]
         R = side * self.RADIUS
         centre = QPointF(cx, cy)
-
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.setPen(Qt.PenStyle.NoPen)
-
         # soft drop shadow: fades to nothing before it can reach the widget edge
         # (the coloured glow lives in the window background, so it is never clipped)
         sr = min(R * 1.08, h - cy - R * 0.03)
@@ -579,7 +613,6 @@ class VinylWidget(QWidget):
             sh.setColorAt(t, QColor(0, 0, 0, int(165 * (1 - u * u * (3 - 2 * u)))))
         p.setBrush(sh)
         p.drawEllipse(QPointF(cx, cy + R * 0.03), sr, sr)
-
         # the record itself (cached, just rotated each frame)
         if self._disc is None or self._disc[0] != side:
             pm, D = self._build_disc(side)
@@ -590,7 +623,6 @@ class VinylWidget(QWidget):
         p.rotate(self.angle)
         p.drawPixmap(QPointF(-D / 2, -D / 2), pm)
         p.restore()
-
         # fixed light reflection across the grooves
         ring = QPainterPath()
         ring.addEllipse(centre, R, R)
@@ -601,11 +633,11 @@ class VinylWidget(QWidget):
 
         def white(a):
             return QColor(255, 255, 255, a)
+
         for pos, a in ((0.0, 0), (0.05, 62), (0.11, 0), (0.5, 0), (0.55, 48), (0.61, 0), (1.0, 0)):
             cg.setColorAt(pos, white(a))
         p.setBrush(QBrush(cg))
         p.drawPath(ring)
-
         span = self.REST_PHI - self.PLAY_PHI
         down = max(0.0, min(1.0, (self.REST_PHI - self.arm_phi) / span))
         self._draw_arm(p, side, ox, oy, down)
@@ -649,6 +681,7 @@ class Bridge(QObject):
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
+
 class Player(QWidget):
     NORMAL_SIZE = QSize(430, 860)
     AMBIENT_SIZE = QSize(560, 820)
@@ -656,14 +689,12 @@ class Player(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Disc Player")
+        self.setWindowTitle("DiscJockey")
         self.resize(self.NORMAL_SIZE)
         self.normal_size = QSize(self.NORMAL_SIZE)
-        self.settings = QSettings("DiscPlayer", "DiscPlayer")
-
+        self.settings = QSettings("DiscJockey", "DiscJockey")
         self.vlc = vlc.Instance("--no-video", "--quiet") if vlc else None
         self.mp = self.vlc.media_player_new() if self.vlc else None
-
         self.drive = None
         self.toc = None
         self.tracks = []          # [{num, dur, title}]
@@ -680,19 +711,16 @@ class Player(QWidget):
         self.backdrop = None
         self.vinyl_mode = self.settings.value("vinyl", True, type=bool)
         self.ambient = False
-
+        self.quitting = False
         self.bridge = Bridge()
         self.bridge.meta.connect(self.apply_meta)
-
         self.build_ui()
         self.apply_theme(self.colors)
         self.set_vinyl(self.vinyl_mode)
         self.set_ambient(self.settings.value("ambient", False, type=bool))
-
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(200)
-
         QShortcut(QKeySequence("Space"), self, self.toggle_play)
         QShortcut(QKeySequence("Ctrl+Right"), self, lambda: self.next_track())
         QShortcut(QKeySequence("Ctrl+Left"), self, self.prev_track)
@@ -700,22 +728,35 @@ class Player(QWidget):
         QShortcut(QKeySequence("A"), self, lambda: self.set_ambient(not self.ambient))
         QShortcut(QKeySequence("F11"), self, self.toggle_fullscreen)
         QShortcut(QKeySequence("Esc"), self, self.on_escape)
-
         if not self.vlc:
             QMessageBox.critical(self, "VLC not found",
                                  "Install VLC (64-bit) and run:  pip install python-vlc")
+
+        # system tray: DiscJockey keeps running here when the window is closed
+        self.tray_menu = QMenu()
+        self.tray_menu.addAction("Open DiscJockey", self.bring_to_front)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction("Quit", self.quit_app)
+        self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay), self)
+        self.tray.setToolTip("DiscJockey")
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(
+            lambda reason: self.bring_to_front()
+            if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.show()
+
         self.scan_drives()
 
     # ---- UI ---------------------------------------------------------------- #
+
     def build_ui(self):
         root = QVBoxLayout(self)
         self.root = root
         root.setContentsMargins(28, 16, 28, 22)
         root.setSpacing(10)
-
         # mode row
         modes = QHBoxLayout()
-        brand = QLabel("DISC PLAYER")
+        brand = QLabel("DISCJOCKEY")
         brand.setObjectName("brand")
         f = brand.font()
         f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
@@ -732,7 +773,6 @@ class Player(QWidget):
         for b in (self.b_vinyl, self.b_ambient, self.b_pin):
             modes.addWidget(b)
         root.addLayout(modes)
-
         # drive row
         self.top_bar = QWidget()
         top = QHBoxLayout(self.top_bar)
@@ -745,7 +785,6 @@ class Player(QWidget):
         top.addWidget(self.drive_box, 1)
         top.addWidget(self.scan_btn)
         root.addWidget(self.top_bar)
-
         # stage: flat art or turntable
         self.stage = QWidget()
         self.stack = QStackedLayout(self.stage)
@@ -755,7 +794,6 @@ class Player(QWidget):
         self.stack.addWidget(self.art)
         self.stack.addWidget(self.vinyl)
         root.addWidget(self.stage)
-
         self.title = QLabel("No disc")
         self.title.setObjectName("title")
         self.title.setWordWrap(True)
@@ -766,14 +804,12 @@ class Player(QWidget):
         self.subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.title)
         root.addWidget(self.subtitle)
-
         self.seek = ClickSlider(Qt.Orientation.Horizontal)
         self.seek.setRange(0, 1)
         self.seek.sliderPressed.connect(lambda: setattr(self, "seeking", True))
         self.seek.sliderReleased.connect(self.on_seek_release)
         self.seek.valueChanged.connect(self.on_seek_value)
         root.addWidget(self.seek)
-
         times = QHBoxLayout()
         self.t_cur = QLabel("0:00")
         self.t_tot = QLabel("0:00")
@@ -781,7 +817,6 @@ class Player(QWidget):
         times.addWidget(self.t_cur)
         times.addWidget(self.t_tot)
         root.addLayout(times)
-
         ctrl = QHBoxLayout()
         ctrl.setSpacing(14)
         self.b_shuffle = self.icon_button("⤮", checkable=True, tip="Shuffle")
@@ -799,7 +834,6 @@ class Player(QWidget):
             ctrl.addWidget(b)
         ctrl.addStretch()
         root.addLayout(ctrl)
-
         self.speed_bar = QWidget()
         speed = QHBoxLayout(self.speed_bar)
         speed.setContentsMargins(0, 0, 0, 0)
@@ -817,7 +851,6 @@ class Player(QWidget):
         speed.addWidget(self.speed_lbl)
         speed.addWidget(reset)
         root.addWidget(self.speed_bar)
-
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(self.on_list_activate)
         root.addWidget(self.list, 1)
@@ -896,7 +929,6 @@ class Player(QWidget):
             veil.setColorAt(0, QColor(0, 0, 0, 60))
             veil.setColorAt(1, QColor(0, 0, 0, 150))
             p.fillRect(r, veil)
-
         # colour glow behind the record / cover. Painted on the window itself (not inside the
         # record widget) so it fades out smoothly instead of being cut off by a widget edge.
         cx, cy, R = self.record_geometry()
@@ -926,6 +958,7 @@ class Player(QWidget):
         return ox + side / 2, oy + side / 2, side * 0.47
 
     # ---- View modes -------------------------------------------------------- #
+
     def set_vinyl(self, on):
         self.vinyl_mode = on
         self.b_vinyl.setChecked(on)
@@ -973,11 +1006,28 @@ class Player(QWidget):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.b_pin.isChecked())
         self.show()
 
-    def closeEvent(self, e):
+    def bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self.quitting = True
         self.stop()
-        super().closeEvent(e)
+        QApplication.quit()
+
+    def closeEvent(self, e):
+        if self.quitting:
+            self.stop()
+            super().closeEvent(e)
+        else:
+            e.ignore()
+            self.hide()   # keep running in the tray; music keeps playing
 
     # ---- Cover / backdrop -------------------------------------------------- #
+
     def set_cover(self, raw):
         self.art.set_pixmap(raw)
         self.vinyl.set_label(raw)
@@ -994,6 +1044,7 @@ class Player(QWidget):
         self.update()
 
     # ---- Disc loading ------------------------------------------------------ #
+
     def scan_drives(self):
         self.drive_box.blockSignals(True)
         self.drive_box.clear()
@@ -1005,6 +1056,18 @@ class Player(QWidget):
             self.clear_disc("No disc drive found", "Connect a CD drive and press Scan")
             return
         self.on_drive_changed()
+
+    def on_disc_inserted(self, letter, attempt=0):
+        if attempt == 0:
+            self.toc = None       # forget the previous disc so we know when this one is read
+            self.bring_to_front()
+        self.scan_drives()
+        idx = self.drive_box.findData(letter)
+        if idx >= 0:
+            self.drive_box.setCurrentIndex(idx)
+        # The disc may still be spinning up, so retry a few times if it isn't read yet
+        if self.toc is None and attempt < 6:
+            QTimer.singleShot(1000, lambda: self.on_disc_inserted(letter, attempt + 1))
 
     def clear_disc(self, title, subtitle):
         self.tracks = []
@@ -1081,6 +1144,7 @@ class Player(QWidget):
         self.list.setCurrentRow(self.order[self.pos])
 
     # ---- Order / shuffle / repeat ------------------------------------------ #
+
     def rebuild_order(self, current_idx):
         n = len(self.tracks)
         order = list(range(n))
@@ -1105,6 +1169,7 @@ class Player(QWidget):
         self.b_repeat.setToolTip(["Repeat: off", "Repeat: all", "Repeat: one"][self.repeat])
 
     # ---- Playback ---------------------------------------------------------- #
+
     def play_pos(self, pos):
         if not (self.mp and self.tracks):
             return
@@ -1180,6 +1245,7 @@ class Player(QWidget):
         self.play_pos(self.order.index(idx))
 
     # ---- Seek / speed / tick ----------------------------------------------- #
+
     def on_seek_value(self, v):
         if self.seeking:
             self.t_cur.setText(fmt_time(v))
@@ -1218,9 +1284,14 @@ class Player(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName("DiscJockey")
     app.setFont(QFont("Segoe UI", 10))
+    app.setQuitOnLastWindowClosed(False)  # the tray keeps the app alive
     w = Player()
-    w.show()
+    disc_watch = DiscArrivalFilter(w.on_disc_inserted)
+    app.installNativeEventFilter(disc_watch)
+    if "--background" not in sys.argv:
+        w.bring_to_front()
     sys.exit(app.exec())
 
 
