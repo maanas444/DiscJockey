@@ -1,0 +1,6 @@
+/vlc
+/venv
+/build
+/dist
+discjockey.spec
+make_icon.py

@@ -113,6 +113,35 @@ def read_toc(letter):
     return {"first": first, "last": last, "offsets": offsets, "leadout": leadout, "audio": audio}
 
 
+IOCTL_STORAGE_CHECK_VERIFY = 0x002D4800
+
+
+def disc_present(letter):
+    """True if the drive currently has media. Doesn't read the disc, so it's cheap."""
+    if sys.platform != "win32":
+        return False
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                    wintypes.LPVOID, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    k32.DeviceIoControl.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    invalid = ctypes.c_void_p(-1).value
+    h = k32.CreateFileW(f"\\\\.\\{letter}:", 0x80000000, 3, None, 3, 0, None)
+    if h is None or h == invalid:
+        return False
+    try:
+        returned = wintypes.DWORD(0)
+        ok = k32.DeviceIoControl(h, IOCTL_STORAGE_CHECK_VERIFY, None, 0, None, 0,
+                                 ctypes.byref(returned), None)
+        return bool(ok)
+    finally:
+        k32.CloseHandle(h)
+
+
 def track_durations(toc):
     """Duration in ms of each audio track."""
     result = {}
@@ -188,43 +217,53 @@ def credit_name(credit):
                    for c in credit or [])
 
 
+def _mb_get_json(url, attempts=3):
+    for i in range(attempts):
+        try:
+            return json.loads(_get(url))
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code == 503 and i < attempts - 1:   # temporary overload: back off and retry
+                time.sleep(2 * (i + 1))
+                continue
+            print("MusicBrainz request failed:", url, e)
+            return None
+    return None
+
+
 def fetch_metadata(toc, n_tracks):
     disc_id = musicbrainz_disc_id(toc)
     toc_str = "+".join(str(x) for x in [toc["first"], toc["last"], toc["leadout"]] +
                        [toc["offsets"][t] for t in range(toc["first"], toc["last"] + 1)
                         if t in toc["offsets"]])
     base = "https://musicbrainz.org/ws/2/discid/"
-    inc = "inc=recordings+artist-credits&fmt=json"
+    inc = "inc=recordings+artist-credits&fmt=json"   # 'discids' is not valid on this endpoint
     urls = [f"{base}{disc_id}?{inc}", f"{base}-?toc={toc_str}&{inc}"]
     for url in urls:
-        try:
-            data = json.loads(_get(url))
-        except Exception:
+        data = _mb_get_json(url)
+        if not data:
             continue
         releases = data.get("releases") or []
-        if not releases:
-            continue
-        rel = releases[0]
-        medium = None
-        for m in rel.get("media", []):
-            if any(d.get("id") == disc_id for d in m.get("discs", [])):
-                medium = m
-                break
-        if medium is None:
-            for m in rel.get("media", []):
-                if len(m.get("tracks", [])) == n_tracks:
-                    medium = m
-                    break
-        titles = [t.get("title", "") for t in (medium or {}).get("tracks", [])]
-        art = None
-        for r in releases[:5]:
-            try:
-                art = _get(f"https://coverartarchive.org/release/{r['id']}/front-500", timeout=15)
-                break
-            except Exception:
-                continue
-        return {"album": rel.get("title", ""), "artist": credit_name(rel.get("artist-credit")),
-                "titles": titles, "art": art}
+        print(f"MusicBrainz: {len(releases)} release(s) for this TOC")
+        # Every release returned here already matches this TOC, so pick the medium
+        # whose track count fits the disc
+        for rel in releases:
+            for medium in rel.get("media", []):
+                if len(medium.get("tracks", [])) != n_tracks:
+                    continue
+                print("MusicBrainz match:", rel.get("title"), "|", rel.get("id"))
+                titles = [t.get("title", "") for t in medium.get("tracks", [])]
+                art = None
+                for r in [rel] + [x for x in releases[:5] if x is not rel]:
+                    try:
+                        art = _get(f"https://coverartarchive.org/release/{r['id']}/front-500",
+                                   timeout=15)
+                        break
+                    except Exception:
+                        continue
+                return {"album": rel.get("title", ""), "artist": credit_name(rel.get("artist-credit")),
+                        "titles": titles, "art": art}
+    print("MusicBrainz: no matching release found")
     return None
 
 
@@ -678,6 +717,68 @@ class Bridge(QObject):
     meta = Signal(object)
 
 
+class DiscMonitor(QObject):
+    """Background thread that watches the selected drive, so the UI never waits on the disc."""
+    disc_changed = Signal(str, bool, object)   # drive letter, disc present?, toc or None
+    MAX_RETRIES = 8                            # disc may still be spinning up
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._letter = None
+        self._present = None           # last presence state we reported
+        self._retries = 0
+        self._retry_pending = False    # True when the last read failed and should be retried
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def set_drive(self, letter):
+        with self._lock:
+            self._letter = letter
+            self._present = None
+            self._retries = 0
+            self._retry_pending = False
+        self._wake.set()
+
+    def poke(self):
+        """Check right away (called when Windows reports a disc arrival)."""
+        self._wake.set()
+
+    def _run(self):
+        while True:
+            with self._lock:
+                letter = self._letter
+            if letter:
+                self._check(letter)
+            self._wake.wait(1.5)
+            self._wake.clear()
+
+    def _check(self, letter):
+        present = disc_present(letter)
+        with self._lock:
+            if letter != self._letter:
+                return
+            if present != self._present:
+                self._present = present
+                self._retries = 0
+                self._retry_pending = False
+            elif not self._retry_pending:
+                return                          # nothing has changed
+            self._retry_pending = False
+        if not present:
+            self.disc_changed.emit(letter, False, None)
+            return
+        toc = read_toc(letter)
+        with self._lock:
+            if letter != self._letter:
+                return                          # user switched drives mid-read
+            if toc is None and self._retries < self.MAX_RETRIES:
+                self._retries += 1
+                self._retry_pending = True      # disc may still be spinning up: try again
+                return
+        self.disc_changed.emit(letter, True, toc)
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -712,6 +813,8 @@ class Player(QWidget):
         self.vinyl_mode = self.settings.value("vinyl", True, type=bool)
         self.ambient = False
         self.quitting = False
+        self.current_key = None        # MusicBrainz disc ID of the disc on screen
+        self.first_check_done = False  # so a disc already in the drive doesn't pop the window
         self.bridge = Bridge()
         self.bridge.meta.connect(self.apply_meta)
         self.build_ui()
@@ -745,6 +848,9 @@ class Player(QWidget):
             if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
 
+        # background disc monitor: spots ejects and inserts without freezing the UI
+        self.monitor = DiscMonitor()
+        self.monitor.disc_changed.connect(self.on_disc_changed)
         self.scan_drives()
 
     # ---- UI ---------------------------------------------------------------- #
@@ -1057,19 +1163,44 @@ class Player(QWidget):
             return
         self.on_drive_changed()
 
-    def on_disc_inserted(self, letter, attempt=0):
-        if attempt == 0:
-            self.toc = None       # forget the previous disc so we know when this one is read
+    def on_disc_inserted(self, letter):
+        # Called by the Windows arrival message. Just wakes the monitor.
+        self.monitor.poke()
+
+    def on_drive_changed(self):
+        letter = self.drive_box.currentData()
+        if not letter:
+            return
+        self.stop()
+        self.drive = letter
+        self.toc = None
+        self.clear_disc("Reading disc…", f"Drive {letter}:")
+        self.monitor.set_drive(letter)
+
+    def on_disc_changed(self, letter, present, toc):
+        if letter != self.drive_box.currentData():
+            return                               # stale result from a previous drive
+        announce = self.first_check_done
+        self.first_check_done = True
+        if not present:
+            self.on_disc_ejected()
+            return
+        if toc is None:
+            self.toc = None
+            self.clear_disc("No audio disc", f"Drive {letter}: is not readable as an audio CD")
+            return
+        self.load_toc(letter, toc)
+        if announce:                             # a disc was inserted while the app was running
             self.bring_to_front()
-        self.scan_drives()
-        idx = self.drive_box.findData(letter)
-        if idx >= 0:
-            self.drive_box.setCurrentIndex(idx)
-        # The disc may still be spinning up, so retry a few times if it isn't read yet
-        if self.toc is None and attempt < 6:
-            QTimer.singleShot(1000, lambda: self.on_disc_inserted(letter, attempt + 1))
+
+    def on_disc_ejected(self):
+        self.toc = None
+        self.stop()                              # stops playback and resets the seek bar
+        self.order, self.pos = [], 0
+        self.clear_disc("No disc", "Insert an audio CD")
 
     def clear_disc(self, title, subtitle):
+        self.current_key = None                  # invalidate any metadata still in flight
         self.tracks = []
         self.list.clear()
         self.title.setText(title)
@@ -1081,36 +1212,35 @@ class Player(QWidget):
         self.t_cur.setText("0:00")
         self.t_tot.setText("0:00")
 
-    def on_drive_changed(self):
-        letter = self.drive_box.currentData()
-        if not letter:
-            return
+    def load_toc(self, letter, toc):
         self.stop()
         self.drive = letter
-        toc = read_toc(letter)
-        if not toc:
-            self.toc = None
-            self.clear_disc("No audio disc", f"Drive {letter}: is empty or not an audio CD")
-            return
         self.toc = toc
         durs = track_durations(toc)
         self.tracks = [{"num": n, "dur": durs[n], "title": f"Track {n:02d}"} for n in toc["audio"]]
         self.album, self.artist = "Audio CD", f"{len(self.tracks)} tracks"
+        self.current_key = musicbrainz_disc_id(toc)
+        print("MusicBrainz disc ID:", self.current_key)   # visible when run from a terminal
         self.set_cover(default_raw())
         self.set_backdrop(None)
+        self.apply_theme(DEFAULT_PALETTE)
         self.rebuild_order(0)
         self.refresh_list()
         self.show_current()
-        threading.Thread(target=self._meta_worker, args=(toc, len(self.tracks)), daemon=True).start()
+        threading.Thread(target=self._meta_worker,
+                         args=(self.current_key, toc, len(self.tracks)), daemon=True).start()
 
-    def _meta_worker(self, toc, n):
+    def _meta_worker(self, key, toc, n):
         try:
-            self.bridge.meta.emit(fetch_metadata(toc, n))
+            meta = fetch_metadata(toc, n)
         except Exception:
-            self.bridge.meta.emit(None)
+            meta = None
+        self.bridge.meta.emit((key, meta))
 
-    def apply_meta(self, meta):
-        if not meta or not self.tracks:
+    def apply_meta(self, payload):
+        key, meta = payload
+        # ignore results for a disc that has since been ejected or replaced
+        if key != self.current_key or not meta or not self.tracks:
             return
         self.album = meta["album"] or self.album
         self.artist = meta["artist"] or self.artist
